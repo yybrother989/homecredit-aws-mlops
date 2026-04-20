@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# uv
+# uv.lock IS committed (reproducibility); only runtime caches ignored
+.uv_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data (never commit raw/processed/trained artifacts)
+data/raw/
+data/processed/
+data/interim/
+data/model/
+*.csv
+*.parquet
+*.feather
+
+# Profile-repo leftovers (these belong to yybrother989/yybrother989, not this project)
+yybrother989_*
+
+# CDK
+infra/cdk.out/
+infra/.cdk.staging/
+*.swp
+
+# AWS — project-local credentials MUST NEVER be committed
+.aws/
+.aws/credentials
+.aws/config
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Secrets
+.env
+*.pem
+kaggle.json
