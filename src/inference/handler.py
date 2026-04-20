@@ -5,7 +5,6 @@ Phase 4 wires this into a real-time endpoint; Phase 5 adds Model Monitor capture
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import lightgbm as lgb

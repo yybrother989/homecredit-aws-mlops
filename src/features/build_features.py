@@ -65,7 +65,7 @@ def load_depth0_group(input_dir: Path, pattern: str) -> pl.DataFrame:
 
 def cast_for_lightgbm(df: pl.DataFrame) -> pl.DataFrame:
     """LightGBM wants numeric or category; convert object/string to Categorical."""
-    for col, dtype in zip(df.columns, df.dtypes):
+    for col, dtype in zip(df.columns, df.dtypes, strict=True):
         if dtype == pl.Utf8:
             df = df.with_columns(pl.col(col).cast(pl.Categorical))
         elif dtype == pl.Date or dtype == pl.Datetime:

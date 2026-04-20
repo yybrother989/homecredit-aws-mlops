@@ -1,13 +1,18 @@
 """Phase 1 base stack: data lake buckets, SageMaker execution role, billing alarm."""
 from aws_cdk import (
-    Stack,
-    RemovalPolicy,
-    Duration,
     CfnOutput,
-    aws_s3 as s3,
-    aws_iam as iam,
-    aws_cloudwatch as cw,
+    Duration,
+    RemovalPolicy,
+    Stack,
+)
+from aws_cdk import (
     aws_budgets as budgets,
+)
+from aws_cdk import (
+    aws_iam as iam,
+)
+from aws_cdk import (
+    aws_s3 as s3,
 )
 from constructs import Construct
 

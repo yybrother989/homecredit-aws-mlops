@@ -12,20 +12,20 @@ import argparse
 import logging
 
 import sagemaker
-from sagemaker.processing import ProcessingInput, ProcessingOutput, ScriptProcessor
-from sagemaker.sklearn.processing import SKLearnProcessor
 from sagemaker.estimator import Estimator
 from sagemaker.inputs import TrainingInput
 from sagemaker.model_metrics import MetricsSource, ModelMetrics
-from sagemaker.workflow.pipeline import Pipeline
-from sagemaker.workflow.pipeline_context import PipelineSession
-from sagemaker.workflow.parameters import ParameterString, ParameterFloat, ParameterInteger
-from sagemaker.workflow.steps import ProcessingStep, TrainingStep
-from sagemaker.workflow.step_collections import RegisterModel
+from sagemaker.processing import ProcessingInput, ProcessingOutput, ScriptProcessor
+from sagemaker.sklearn.processing import SKLearnProcessor
 from sagemaker.workflow.condition_step import ConditionStep
 from sagemaker.workflow.conditions import ConditionGreaterThanOrEqualTo
 from sagemaker.workflow.functions import JsonGet
+from sagemaker.workflow.parameters import ParameterFloat, ParameterInteger, ParameterString
+from sagemaker.workflow.pipeline import Pipeline
+from sagemaker.workflow.pipeline_context import PipelineSession
 from sagemaker.workflow.properties import PropertyFile
+from sagemaker.workflow.step_collections import RegisterModel
+from sagemaker.workflow.steps import ProcessingStep, TrainingStep
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)

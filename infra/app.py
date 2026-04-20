@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """CDK app entrypoint for Home Credit MLOps infra."""
 import os
+
 import aws_cdk as cdk
 from stacks.base_stack import HomeCreditBaseStack
 

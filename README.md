@@ -48,7 +48,7 @@ flowchart LR
 ## Repository layout
 
 ```
-homecredit2026/
+homecredit-aws-mlops/
 ├── infra/              # CDK stacks (S3, IAM, SageMaker domain, pipelines)
 ├── src/
 │   ├── features/       # Feature engineering (Polars → Glue)
@@ -110,4 +110,4 @@ uv run python docs/architecture.py   # writes architecture.png + architecture.sv
 ## Links
 
 - [Kaggle competition](https://www.kaggle.com/competitions/home-credit-credit-risk-model-stability/)
-- GitHub: [yybrother989/homecredit2026](https://github.com/yybrother989/homecredit2026)
+- GitHub: [yybrother989/homecredit-aws-mlops](https://github.com/yybrother989/homecredit-aws-mlops)
