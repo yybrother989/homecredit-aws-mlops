@@ -1,10 +1,13 @@
-"""LightGBM baseline training script.
+"""LightGBM training script.
 
-Runs locally for debugging and inside a SageMaker Training Job in Phase 3.
-SageMaker convention:
-  - training data at /opt/ml/input/data/train/
-  - model output at /opt/ml/model/
-  - hyperparameters injected via CLI args
+Runs in three modes:
+  * `--feature-source local`   — reads parquet from SM_CHANNEL_{TRAIN,VALIDATION}
+    (SageMaker convention; also the local-dev path).
+  * `--feature-source parquet` — reads parquet directly from an S3 prefix
+    (useful as a shortcut before Feature Store ingestion completes).
+  * `--feature-source athena`  — queries the SageMaker Feature Store offline
+    store via Athena; uses the Glue Data Catalog table auto-registered by the
+    Feature Group. Honors WEEK_NUM-based train/val split on the fly.
 """
 from __future__ import annotations
 
@@ -37,6 +40,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--early-stopping-rounds", type=int, default=50)
     p.add_argument("--target", type=str, default="target")
     p.add_argument("--week-col", type=str, default="WEEK_NUM")
+    p.add_argument("--feature-source", choices=["local", "parquet", "athena"], default="local")
+    p.add_argument("--val-weeks-frac", type=float, default=0.2,
+                   help="Fraction of weeks (last) used for validation when source != local")
     return p.parse_args()
 
 
@@ -47,10 +53,59 @@ def load_parquet_dir(path: str) -> pd.DataFrame:
     return pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
 
 
-def stability_metric(y_true: np.ndarray, y_pred: np.ndarray, weeks: np.ndarray) -> float:
-    """Kaggle's stability metric: mean(weekly Gini) - penalty*std(weekly Gini) - falling-trend penalty.
+ATHENA_DB = "homecredit_ml"
+ATHENA_TABLE = "features"
 
-    This is the official competition metric; exact form matters for model selection.
+
+def load_from_athena(val_weeks_frac: float) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Query the Glue feature output via Athena external table, then time-split.
+
+    The table is registered by `src/features/ingest_to_feature_store.py`.
+    Athena lowercases all identifiers; we restore `WEEK_NUM` capitalization
+    after the pull so downstream code doesn't branch on case.
+    """
+    import awswrangler as wr
+    import boto3
+
+    cfn = boto3.client("cloudformation")
+    outs = cfn.describe_stacks(StackName="HomeCreditBaseStack")["Stacks"][0]["Outputs"]
+    artifacts_bucket = next(o["OutputValue"] for o in outs if o["OutputKey"] == "ArtifactsBucketName")
+    staging = f"s3://{artifacts_bucket}/athena/"
+
+    log.info("Pulling %s.%s from Athena (staging %s)", ATHENA_DB, ATHENA_TABLE, staging)
+    # ctas_approach=True → Athena materializes results as parquet in staging,
+    # which awswrangler reads back. For a wide 975-col / 1.5M-row table this
+    # is ~3× smaller and 10× faster than the CSV path.
+    df = wr.athena.read_sql_query(
+        sql=f"SELECT * FROM {ATHENA_TABLE}",
+        database=ATHENA_DB,
+        s3_output=staging,
+        ctas_approach=True,
+    )
+    log.info("  pulled %s", df.shape)
+
+    rename = {c: "WEEK_NUM" if c.lower() == "week_num" else c for c in df.columns}
+    df = df.rename(columns=rename)
+
+    weeks = sorted(df["WEEK_NUM"].unique().tolist())
+    cutoff = int(len(weeks) * (1 - val_weeks_frac))
+    val_weeks = set(weeks[cutoff:])
+    return df[~df["WEEK_NUM"].isin(val_weeks)], df[df["WEEK_NUM"].isin(val_weeks)]
+
+
+def load_data(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if args.feature_source == "local":
+        log.info("Loading local parquet from %s and %s", SM_TRAIN_DIR, SM_VAL_DIR)
+        return load_parquet_dir(SM_TRAIN_DIR), load_parquet_dir(SM_VAL_DIR)
+    if args.feature_source == "athena":
+        return load_from_athena(args.val_weeks_frac)
+    raise ValueError(f"--feature-source={args.feature_source} not yet implemented")
+
+
+def stability_metric(y_true: np.ndarray, y_pred: np.ndarray, weeks: np.ndarray) -> float:
+    """Kaggle's stability metric: mean(weekly Gini) + slope-penalty - std-penalty.
+
+    Official competition metric; exact form matters for model selection.
     """
     df = pd.DataFrame({"y": y_true, "p": y_pred, "w": weeks})
     ginis = []
@@ -71,20 +126,23 @@ def stability_metric(y_true: np.ndarray, y_pred: np.ndarray, weeks: np.ndarray) 
 def main() -> None:
     args = parse_args()
 
-    log.info("Loading data from %s and %s", SM_TRAIN_DIR, SM_VAL_DIR)
-    train_df = load_parquet_dir(SM_TRAIN_DIR)
-    val_df = load_parquet_dir(SM_VAL_DIR)
+    train_df, val_df = load_data(args)
+    log.info("train=%s  val=%s", train_df.shape, val_df.shape)
 
-    drop_cols = [args.target, args.week_col, "case_id"]
+    drop_cols = [args.target, args.week_col, "case_id", "date_decision"]
     feature_cols = [c for c in train_df.columns if c not in drop_cols]
 
-    # Cast string/object columns to pandas Categorical so LightGBM can split on them.
-    obj_cols = [c for c in feature_cols if train_df[c].dtype == "object"]
+    # Any non-numeric column (pandas `object` from parquet, `string[pyarrow]`
+    # from Athena CTAS, or explicit `category`) needs categorical encoding.
+    obj_cols = [
+        c for c in feature_cols
+        if str(train_df[c].dtype) in {"object", "string", "category"}
+        or str(train_df[c].dtype).startswith("string")
+    ]
     if obj_cols:
-        log.info("Casting %d object columns to category: %s...", len(obj_cols), obj_cols[:5])
+        log.info("Casting %d non-numeric columns to category: %s...", len(obj_cols), obj_cols[:5])
         for c in obj_cols:
             train_df[c] = train_df[c].astype("category")
-            # Align val categories to train's to avoid unseen-category errors
             val_df[c] = val_df[c].astype(
                 pd.CategoricalDtype(categories=train_df[c].cat.categories)
             )

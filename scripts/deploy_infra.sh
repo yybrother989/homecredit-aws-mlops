@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Deploy Phase 1 CDK stack to us-west-2.
+# Deploy all CDK stacks for Home Credit MLOps to us-west-2:
+#   - HomeCreditBaseStack    (Phase 1: S3, IAM, budget)
+#   - HomeCreditFeatureStack (Phase 2: Glue job, Feature Store grants)
 set -euo pipefail
 
 export CDK_DEFAULT_REGION=us-west-2
@@ -17,5 +19,5 @@ fi
 echo "==> Synthesizing..."
 uv run cdk synth --quiet
 
-echo "==> Deploying HomeCreditBaseStack..."
-uv run cdk deploy HomeCreditBaseStack --require-approval never
+echo "==> Deploying all stacks..."
+uv run cdk deploy --all --require-approval never

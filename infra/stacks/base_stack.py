@@ -14,6 +14,9 @@ from aws_cdk import (
 from aws_cdk import (
     aws_s3 as s3,
 )
+from aws_cdk import (
+    aws_servicecatalogappregistry as appreg,
+)
 from constructs import Construct
 
 
@@ -25,7 +28,7 @@ class HomeCreditBaseStack(Stack):
         suffix = f"{account}-usw2"
 
         # --- Data lake buckets (bronze / silver / gold) ---
-        raw_bucket = s3.Bucket(
+        self.raw_bucket = raw_bucket = s3.Bucket(
             self, "RawBucket",
             bucket_name=f"homecredit-raw-{suffix}",
             versioned=True,
@@ -45,7 +48,7 @@ class HomeCreditBaseStack(Stack):
             ],
         )
 
-        processed_bucket = s3.Bucket(
+        self.processed_bucket = processed_bucket = s3.Bucket(
             self, "ProcessedBucket",
             bucket_name=f"homecredit-processed-{suffix}",
             encryption=s3.BucketEncryption.S3_MANAGED,
@@ -54,7 +57,7 @@ class HomeCreditBaseStack(Stack):
             auto_delete_objects=True,
         )
 
-        artifacts_bucket = s3.Bucket(
+        self.artifacts_bucket = artifacts_bucket = s3.Bucket(
             self, "ArtifactsBucket",
             bucket_name=f"homecredit-artifacts-{suffix}",
             versioned=True,
@@ -65,7 +68,7 @@ class HomeCreditBaseStack(Stack):
         )
 
         # --- SageMaker execution role ---
-        sm_role = iam.Role(
+        self.sm_role = sm_role = iam.Role(
             self, "SageMakerExecutionRole",
             role_name="HomeCreditSageMakerExecutionRole",
             assumed_by=iam.ServicePrincipal("sagemaker.amazonaws.com"),
@@ -77,7 +80,7 @@ class HomeCreditBaseStack(Stack):
             b.grant_read_write(sm_role)
 
         # --- Glue role for feature engineering (Phase 2) ---
-        glue_role = iam.Role(
+        self.glue_role = glue_role = iam.Role(
             self, "GlueETLRole",
             role_name="HomeCreditGlueETLRole",
             assumed_by=iam.ServicePrincipal("glue.amazonaws.com"),
@@ -99,9 +102,25 @@ class HomeCreditBaseStack(Stack):
             ),
         )
 
+        # --- AppRegistry application (groups resources in Console myApplications view) ---
+        application = appreg.CfnApplication(
+            self, "HomeCreditApplication",
+            name="HomeCredit",
+            description="Home Credit Default Risk MLOps portfolio project",
+            tags={"Project": "HomeCredit", "ManagedBy": "CDK"},
+        )
+
+        appreg.CfnResourceAssociation(
+            self, "HomeCreditStackAssociation",
+            application=application.attr_id,
+            resource=self.stack_id,
+            resource_type="CFN_STACK",
+        )
+
         # --- Outputs ---
         CfnOutput(self, "RawBucketName", value=raw_bucket.bucket_name)
         CfnOutput(self, "ProcessedBucketName", value=processed_bucket.bucket_name)
         CfnOutput(self, "ArtifactsBucketName", value=artifacts_bucket.bucket_name)
         CfnOutput(self, "SageMakerRoleArn", value=sm_role.role_arn)
         CfnOutput(self, "GlueRoleArn", value=glue_role.role_arn)
+        CfnOutput(self, "ApplicationArn", value=application.attr_arn)

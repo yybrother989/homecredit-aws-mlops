@@ -18,10 +18,13 @@ venv/
 data/raw/
 data/processed/
 data/interim/
-data/model/
+data/model*/
 *.csv
 *.parquet
 *.feather
+
+# Claude Code session state (lock files, plans)
+.claude/
 
 # Profile-repo leftovers (these belong to yybrother989/yybrother989, not this project)
 yybrother989_*

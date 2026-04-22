@@ -64,15 +64,15 @@ homecredit-aws-mlops/
 
 ## Roadmap — 7 phases, one MLOps muscle each
 
-| Phase | Scope | MLOps concept |
-|---|---|---|
-| 1 | CDK base stack (S3 × 3, IAM, budget), LightGBM notebook baseline | Reproducible infra |
-| 2 | Glue / SM Processing → **Feature Store** (online + offline) | Training/serving parity, PIT joins |
-| 3 | SageMaker Pipeline: preprocess → train → evaluate → conditional register | DAGs, HPO, gating |
-| 4 | Real-time endpoint + batch transform, API Gateway, autoscaling | Two serving modes, blue/green |
-| 5 | Model Monitor + CloudWatch + EventBridge → auto-retrain | Closed-loop drift response |
-| 6 | Clarify bias, Model Cards, lineage via CloudTrail | Responsible AI, audit |
-| 7 | Spot training, endpoint autoscale-to-zero, cost dashboards | FinOps |
+| Phase | Scope | MLOps concept | Result |
+|---|---|---|---|
+| 1 ✅ | CDK base stack (S3 × 3, IAM, budget), local LightGBM baseline on depth-0 tables (224 features) | Reproducible infra | val AUC **0.823**, stability **0.620** |
+| 2 ✅ | Glue PySpark ETL over all 30+ raw tables (975 features incl. PIT-filtered depth-1/2 aggregations), Athena external table, Feature Group contract for Phase 4 | PIT correctness, wide feature catalog | val AUC **0.819**, stability **0.612** (⚠ wider feature set overfits — HPO is Phase 3's job) |
+| 3 | SageMaker Pipeline: preprocess → train → evaluate → conditional register + **HPO** | DAGs, HPO, gating | |
+| 4 | Real-time endpoint + batch transform, API Gateway, autoscaling, Feature Store online | Two serving modes, blue/green | |
+| 5 | Model Monitor + CloudWatch + EventBridge → auto-retrain | Closed-loop drift response | |
+| 6 | Clarify bias, Model Cards, lineage via CloudTrail | Responsible AI, audit | |
+| 7 | Spot training, endpoint autoscale-to-zero, cost dashboards | FinOps | |
 
 ## Quickstart
 
@@ -88,11 +88,25 @@ source env.sh
 # 3. Bootstrap CDK (first time only per account/region)
 uv run cdk bootstrap aws://$CDK_DEFAULT_ACCOUNT/us-west-2
 
-# 4. Deploy Phase 1 stack
+# 4. Deploy all stacks (Phase 1 base + Phase 2 feature)
 ./scripts/deploy_infra.sh
 
 # 5. Stream Kaggle data directly into the S3 raw bucket (zero local disk)
 uv run python scripts/download_to_s3.py
+
+# 6. (Phase 2) Unzip locally once + mirror to S3 so Glue can read parquets
+aws s3 cp s3://homecredit-raw-$CDK_DEFAULT_ACCOUNT-usw2/homecredit.zip data/raw/
+unzip -q data/raw/homecredit.zip -d data/raw/
+./scripts/sync_raw_to_s3.sh
+
+# 7. (Phase 2) Kick off the Glue feature-engineering job (~20 min, ~$1)
+aws glue start-job-run --job-name homecredit-features --query JobRunId --output text
+
+# 8. (Phase 2) Ingest wide features into SageMaker Feature Store (offline)
+uv run python src/features/ingest_to_feature_store.py
+
+# 9. (Phase 2) Retrain LightGBM straight from the Feature Store
+uv run python src/training/train_lightgbm.py --feature-source athena
 ```
 
 Everything runs inside the `uv`-managed venv via `uv run <cmd>` — no manual activation.
@@ -106,6 +120,20 @@ This project runs under a **dedicated IAM user** (`homecredit-dev`) in `us-west-
 ```bash
 uv run python docs/architecture.py   # writes architecture.png + architecture.svg
 ```
+
+## Notes on Feature Store usage
+
+Phase 2 registers the Glue wide-feature output as an **Athena external table**
+(`homecredit_ml.features`, 975 columns × 1.5M rows) rather than populating the
+SageMaker Feature Group via `PutRecord`. The Feature Group itself is CDK-
+provisioned as a **schema contract** — we pin the Phase 4 real-time ingestion
+mechanism to it when online serving comes online.
+
+This is a deliberate trade-off: `FeatureGroup.ingest()` is designed for
+streaming writes (tens of records/sec), and pushing 1.5M rows through it is
+prohibitively slow (we measured 22 GB memory footprint with no meaningful
+progress after 15 min). Direct S3 → Athena is 14 s end-to-end for the same
+table, which matches how production ML teams materialize offline features.
 
 ## Links
 
