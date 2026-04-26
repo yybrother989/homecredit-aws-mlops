@@ -1,0 +1,19 @@
+# Pinned to a single set of mutually-compatible versions. The whole point of
+# this image is to escape the SageMaker sklearn-1.2-1 base image's numpy/
+# pandas/pyarrow ABI lock — every version below was selected so the C
+# extensions agree on numpy ABI 1.x.
+numpy==1.26.4
+pandas==2.2.3
+pyarrow==15.0.2
+scipy==1.13.1
+scikit-learn==1.4.2
+lightgbm==4.3.0
+awswrangler==3.6.0
+boto3>=1.34,<2
+# NOTE: We deliberately do NOT install `sagemaker-training` — its wheel
+# build fails on Python 3.11 (last release was 2022). For Processing jobs
+# we set `command=["python3"]` on ScriptProcessor so the container's
+# ENTRYPOINT is irrelevant. For Training jobs we use a hand-rolled
+# `train` shim (see Dockerfile) that implements SageMaker's container
+# contract: read /opt/ml/input/config/hyperparameters.json → exec the
+# entry-point program with --flag value pairs.

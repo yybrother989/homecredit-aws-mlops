@@ -22,10 +22,10 @@ import argparse
 import logging
 
 import boto3
+from sagemaker.estimator import Estimator
 from sagemaker.inputs import TrainingInput
 from sagemaker.model_metrics import MetricsSource, ModelMetrics
-from sagemaker.processing import FrameworkProcessor, ProcessingInput, ProcessingOutput
-from sagemaker.sklearn.estimator import SKLearn
+from sagemaker.processing import ProcessingInput, ProcessingOutput, ScriptProcessor
 from sagemaker.tuner import ContinuousParameter, HyperparameterTuner, IntegerParameter
 from sagemaker.workflow.condition_step import ConditionStep
 from sagemaker.workflow.conditions import ConditionGreaterThanOrEqualTo
@@ -57,7 +57,9 @@ def cfn_output(stack_name: str, key: str) -> str:
 def build_pipeline(role_arn: str, max_jobs: int = 20, max_parallel_jobs: int = 4) -> Pipeline:
     session = PipelineSession()
     artifacts_bucket = cfn_output("HomeCreditBaseStack", "ArtifactsBucketName")
+    images_repo = cfn_output("HomeCreditTrainingStack", "ImagesRepoUri")
     athena_staging = f"s3://{artifacts_bucket}/athena/"
+    custom_image = f"{images_repo}:latest"   # built by scripts/build_and_push_image.sh
 
     # --- Parameters (overridable at StartPipelineExecution) ---
     p_stability = ParameterFloat("StabilityThreshold", default_value=0.55)
@@ -65,19 +67,17 @@ def build_pipeline(role_arn: str, max_jobs: int = 20, max_parallel_jobs: int = 4
     p_max_jobs = ParameterInteger("MaxJobs", default_value=max_jobs)
     p_max_parallel = ParameterInteger("MaxParallelJobs", default_value=max_parallel_jobs)
 
-    # FrameworkProcessor + SKLearn auto-resolve the sklearn 1.2-1 image and
-    # pip-install whatever's in `source_dir/requirements.txt` before the
-    # container runs the entrypoint.
+    # All Processing + Training steps use our custom python:3.11-slim image
+    # (numpy 1.26 + pandas 2.2 + pyarrow 15 + awswrangler 3.6 + lightgbm 4.3
+    # + scikit-learn 1.4) — built once, ABI-consistent, no requirements.txt
+    # mid-job pip installs.
 
     # ========================================================================
     # Step 1: pull features from Athena
-    # FrameworkProcessor (sklearn family) auto-bundles `source_dir` and pip-
-    # installs its requirements.txt before running `code`. We need awswrangler
-    # + pyarrow on top of the sklearn base image.
     # ========================================================================
-    pull_processor = FrameworkProcessor(
-        estimator_cls=SKLearn,
-        framework_version="1.2-1",
+    pull_processor = ScriptProcessor(
+        image_uri=custom_image,
+        command=["python3"],
         role=role_arn,
         instance_type="ml.t3.xlarge",
         instance_count=1,
@@ -86,33 +86,34 @@ def build_pipeline(role_arn: str, max_jobs: int = 20, max_parallel_jobs: int = 4
     )
     step_pull = ProcessingStep(
         name="PullFeatures",
-        step_args=pull_processor.run(
-            code="pull_features.py",
-            source_dir="src/pipelines",
-            outputs=[
-                ProcessingOutput(output_name="train",
-                                 source="/opt/ml/processing/output/train"),
-                ProcessingOutput(output_name="validation",
-                                 source="/opt/ml/processing/output/validation"),
-            ],
-            arguments=[
-                "--athena-database", "homecredit_ml",
-                "--athena-table", "features",
-                "--athena-staging-uri", athena_staging,
-                "--output-dir", "/opt/ml/processing/output",
-            ],
-        ),
+        processor=pull_processor,
+        outputs=[
+            ProcessingOutput(output_name="train",
+                             source="/opt/ml/processing/output/train"),
+            ProcessingOutput(output_name="validation",
+                             source="/opt/ml/processing/output/validation"),
+        ],
+        code="src/pipelines/pull_features.py",
+        job_arguments=[
+            "--athena-database", "homecredit_ml",
+            "--athena-table", "features",
+            "--athena-staging-uri", athena_staging,
+            "--output-dir", "/opt/ml/processing/output",
+        ],
     )
 
     # ========================================================================
     # Step 2: HPO via SageMaker Automatic Model Tuning
+    # Custom container's `/usr/local/bin/train` shim parses
+    # /opt/ml/input/config/hyperparameters.json and execs the entrypoint
+    # script with --flag value pairs. The SDK uploads source_dir → /opt/ml/code,
+    # sets SAGEMAKER_PROGRAM, and the shim handles the rest.
     # ========================================================================
-    lightgbm_estimator = SKLearn(
+    lightgbm_estimator = Estimator(
+        image_uri=custom_image,
         entry_point="train_lightgbm.py",
         source_dir="src/training",
         role=role_arn,
-        framework_version="1.2-1",
-        py_version="py3",
         instance_type="ml.t3.xlarge",
         instance_count=1,
         output_path=f"s3://{artifacts_bucket}/models/hpo/",
@@ -126,8 +127,6 @@ def build_pipeline(role_arn: str, max_jobs: int = 20, max_parallel_jobs: int = 4
             {"Name": "validation:auc",       "Regex": r"Validation AUC=([0-9\.]+)"},
             {"Name": "validation:stability", "Regex": r"Stability=([0-9\.]+)"},
         ],
-        # Install lightgbm into the container at startup
-        dependencies=["src/training/lightgbm_requirements.txt"],
     )
 
     tuner = HyperparameterTuner(
@@ -169,9 +168,9 @@ def build_pipeline(role_arn: str, max_jobs: int = 20, max_parallel_jobs: int = 4
         output_name="evaluation",
         path="evaluation.json",
     )
-    evaluator = FrameworkProcessor(
-        estimator_cls=SKLearn,
-        framework_version="1.2-1",
+    evaluator = ScriptProcessor(
+        image_uri=custom_image,
+        command=["python3"],
         role=role_arn,
         instance_type="ml.t3.large",
         instance_count=1,
@@ -188,21 +187,19 @@ def build_pipeline(role_arn: str, max_jobs: int = 20, max_parallel_jobs: int = 4
 
     step_eval = ProcessingStep(
         name="EvaluateBestModel",
-        step_args=evaluator.run(
-            code="evaluate.py",
-            source_dir="src/pipelines",
-            inputs=[
-                ProcessingInput(source=best_model_uri, destination="/opt/ml/processing/model"),
-                ProcessingInput(
-                    source=step_pull.properties.ProcessingOutputConfig.Outputs["validation"].S3Output.S3Uri,
-                    destination="/opt/ml/processing/validation",
-                ),
-            ],
-            outputs=[
-                ProcessingOutput(output_name="evaluation",
-                                 source="/opt/ml/processing/evaluation"),
-            ],
-        ),
+        processor=evaluator,
+        inputs=[
+            ProcessingInput(source=best_model_uri, destination="/opt/ml/processing/model"),
+            ProcessingInput(
+                source=step_pull.properties.ProcessingOutputConfig.Outputs["validation"].S3Output.S3Uri,
+                destination="/opt/ml/processing/validation",
+            ),
+        ],
+        outputs=[
+            ProcessingOutput(output_name="evaluation",
+                             source="/opt/ml/processing/evaluation"),
+        ],
+        code="src/pipelines/evaluate.py",
         property_files=[eval_report],
     )
 

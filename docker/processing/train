@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Hand-rolled SageMaker training-job entrypoint, replacing the
+# `sagemaker-training-toolkit`'s `train` console script (which doesn't build
+# on Python 3.11).
+#
+# SageMaker's contract for training containers:
+#   - Code is uploaded to /opt/ml/code/ (when entry_point + source_dir set).
+#   - Hyperparameters JSON-serialized to /opt/ml/input/config/hyperparameters.json.
+#   - SAGEMAKER_PROGRAM env var names the entry-point script.
+#   - Channel data mounted at /opt/ml/input/data/<channel_name>/.
+#   - Container should write model to /opt/ml/model/, fail with non-zero exit
+#     to signal a failed training job.
+#
+# We translate that into:  python -u $SAGEMAKER_PROGRAM --hp1 v1 --hp2 v2 ...
+set -euo pipefail
+
+PROGRAM="${SAGEMAKER_PROGRAM:-train_lightgbm.py}"
+CODE_DIR="/opt/ml/code"
+HP_FILE="/opt/ml/input/config/hyperparameters.json"
+
+cd "${CODE_DIR}"
+
+ARGS=()
+if [[ -f "${HP_FILE}" ]]; then
+    while IFS=$'\t' read -r key value; do
+        ARGS+=("--${key}" "${value}")
+    done < <(python3 -c '
+import json, sys
+with open("'"${HP_FILE}"'") as f:
+    for k, v in json.load(f).items():
+        # SageMaker JSON-encodes string values; strip the wrapping quotes
+        if isinstance(v, str) and v.startswith("\"") and v.endswith("\""):
+            v = v[1:-1]
+        sys.stdout.write(f"{k}\t{v}\n")
+')
+fi
+
+exec python3 -u "${PROGRAM}" "${ARGS[@]}"

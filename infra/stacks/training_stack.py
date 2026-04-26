@@ -1,10 +1,13 @@
-"""Phase 3 training stack: Model Package Group + Athena grants for HPO pipeline.
+"""Phase 3 training stack: Model Package Group + ECR repo for BYO container
++ Athena grants for HPO pipeline.
 
 What it provisions:
   - `HomeCreditModels` SageMaker Model Package Group (registry for trained
     model versions produced by HomeCreditTrainingPipeline).
-  - Extends the SageMaker execution role with Athena + Glue Data Catalog read
-    so the PullFeatures ProcessingStep can query via CTAS.
+  - `homecredit-images` ECR repository for the project's custom container
+    (built by scripts/build_and_push_image.sh, consumed by the Pipeline).
+  - Extends the SageMaker execution role with: Athena + Glue Data Catalog
+    read so PullFeatures can CTAS; ECR pull on the new repo; HPO APIs.
 
 What it intentionally does NOT do:
   - CDK does not create the SageMaker Pipeline definition itself; the
@@ -14,7 +17,11 @@ What it intentionally does NOT do:
 """
 from aws_cdk import (
     CfnOutput,
+    RemovalPolicy,
     Stack,
+)
+from aws_cdk import (
+    aws_ecr as ecr,
 )
 from aws_cdk import (
     aws_iam as iam,
@@ -25,6 +32,7 @@ from aws_cdk import (
 from constructs import Construct
 
 MODEL_PACKAGE_GROUP = "HomeCreditModels"
+ECR_REPO_NAME = "homecredit-images"
 
 
 class HomeCreditTrainingStack(Stack):
@@ -37,6 +45,25 @@ class HomeCreditTrainingStack(Stack):
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
+
+        # --- ECR repo for custom container (BYO image, Phase 7 slice) ---
+        images_repo = ecr.Repository(
+            self, "ImagesRepo",
+            repository_name=ECR_REPO_NAME,
+            image_scan_on_push=True,
+            image_tag_mutability=ecr.TagMutability.MUTABLE,
+            removal_policy=RemovalPolicy.DESTROY,
+            empty_on_delete=True,
+            lifecycle_rules=[
+                ecr.LifecycleRule(
+                    description="Keep last 10 image versions",
+                    max_image_count=10,
+                    rule_priority=1,
+                ),
+            ],
+        )
+        # Allow SageMaker exec role to pull this image at job start
+        images_repo.grant_pull(sm_role)
 
         # --- Model Package Group ---
         mpg = sagemaker.CfnModelPackageGroup(
@@ -95,3 +122,9 @@ class HomeCreditTrainingStack(Stack):
                   value=MODEL_PACKAGE_GROUP,
                   export_name="HomeCreditModelPackageGroup")
         CfnOutput(self, "ModelPackageGroupArn", value=mpg.attr_model_package_group_arn)
+        CfnOutput(self, "ImagesRepoUri",
+                  value=images_repo.repository_uri,
+                  export_name="HomeCreditImagesRepoUri")
+        CfnOutput(self, "ImagesRepoName",
+                  value=images_repo.repository_name,
+                  export_name="HomeCreditImagesRepoName")

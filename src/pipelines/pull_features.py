@@ -23,33 +23,14 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import subprocess
-import sys
 from pathlib import Path
 
-# SageMaker Processing containers don't inherit AWS_DEFAULT_REGION from the
-# job's run environment — boto3 calls need it set explicitly or the resolver
-# raises NoRegionError. The job runs in us-west-2 by definition (we deploy
-# only there), so hard-coding is fine for this project.
+import awswrangler as wr
+
+# Custom container ships ABI-consistent numpy/pandas/pyarrow/awswrangler;
+# AWS_DEFAULT_REGION baked in via Dockerfile but defensive setdefault here
+# matches local dev where it might be unset.
 os.environ.setdefault("AWS_DEFAULT_REGION", "us-west-2")
-
-# The SageMaker sklearn 1.2-1 container ships pandas 1.1.3 / numpy 1.24.1 /
-# scipy 1.8.0 — too old for awswrangler. requirements.txt-based installs by
-# FrameworkProcessor leave a mixed binary state where pyarrow/pandas were
-# upgraded but their compiled extensions still reference the original numpy,
-# causing `numpy.core.multiarray failed to import`. The bulletproof fix is
-# `--force-reinstall` of the whole data-stack as a single consistent group
-# BEFORE the first `import` of any of them.
-subprocess.check_call([
-    sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir",
-    "--upgrade", "--force-reinstall",
-    "numpy==1.26.4",
-    "pandas==2.2.3",
-    "pyarrow==15.0.2",
-    "awswrangler==3.6.0",
-])
-
-import awswrangler as wr  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)

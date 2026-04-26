@@ -140,30 +140,32 @@ uv run python docs/architecture.py   # writes architecture.png + architecture.sv
 4. **StabilityGate** (`ConditionStep`) — if `stability ≥ 0.55`, register the
    model to `HomeCreditModels` package group as `PendingManualApproval`.
 
-**Known blockers (chasing them in order):**
+**Blockers — solved + remaining:**
 
-1. **AWS account service quotas** — fresh accounts ship with
-   `ml.m5.xlarge processing/training job usage = 0`. Only `ml.t3.{medium,
-   large,xlarge}` have nonzero defaults. Pipeline currently pinned to t3.xlarge
-   (sufficient for 975-feature LightGBM, slower per trial). Production fix:
-   AWS Service Quotas request for `ml.m5.xlarge` (1–3 days turnaround).
-2. **Container dependency hell** — the SageMaker `sklearn 1.2-1` base image
-   ships Python 3.9 + numpy 1.24 + pandas 1.1 + scipy 1.8, all binary-
-   compatible with each other. Layering modern `awswrangler` / `pyarrow`
-   via `requirements.txt` forces a partial upgrade that breaks numpy ABI on
-   pyarrow's Table → pandas conversion (`numpy.core.multiarray failed to
-   import`). Tried `--force-reinstall` of the whole numpy/pandas/pyarrow
-   group — got further (Athena CTAS query succeeded, output parquet read)
-   but hit a `MultiIndex` deserialization failure during column metadata
-   reconstruction at 975-column scale. Production fix: custom Docker image
-   in ECR with the data stack baked in, plus `--datalake-formats iceberg`
-   for write parity. Tracked as Phase 7 FinOps "BYO container" task.
+1. ~~**Container dependency hell**~~ ✅ **SOLVED.** Built a clean
+   `python:3.11-slim` image with the data + ML stack pinned to one
+   ABI-consistent set (`numpy 1.26.4 / pandas 2.2.3 / pyarrow 15.0.2 /
+   scikit-learn 1.4.2 / lightgbm 4.3.0 / awswrangler 3.6.0`). Pushed to a
+   project-dedicated ECR repo (`homecredit-images`), wired into both
+   Processing + Training steps via `image_uri=`. Hand-rolled
+   `/usr/local/bin/train` shim replaces the sagemaker-training-toolkit
+   (which doesn't build on Py 3.11): reads
+   `/opt/ml/input/config/hyperparameters.json`, exec's the entrypoint
+   script with `--flag value` pairs.
+2. **AWS account service quotas** — still the gate. Fresh accounts ship
+   with `ml.m5.* processing/training job usage = 0`; only
+   `ml.t3.{medium,large,xlarge}` have nonzero defaults. With the custom
+   container, `ml.t3.xlarge` (16 GB RAM) hits OOM loading the full
+   1.5M × 975 dataframe — the dataset needs `ml.m5.4xlarge` (64 GB) or
+   chunked / Polars-streaming processing. Production fix: Service Quotas
+   request for `ml.m5.4xlarge` (1–3 days) or rewrite `pull_features.py`
+   to chunk by `WEEK_NUM` and stream to disk.
 
-Until those are unblocked, Phase 3 is **code-complete + CDK-deployed**:
-`HomeCreditTrainingStack` is live, `HomeCreditModels` package group exists,
-`HomeCreditTrainingPipeline` is upserted and visible in SageMaker Studio,
-and any pipeline execution gets as far as the PullFeatures step before the
-container env mismatch trips it.
+Until the quota is approved, Phase 3 is **code-complete + CDK-deployed +
+container-ready**: `HomeCreditTrainingStack` live (now including ECR repo),
+`HomeCreditModels` package group exists, `HomeCreditTrainingPipeline`
+upserted with custom image, ready to run as soon as a memory-adequate
+instance type is unblocked.
 
 ## Notes on Feature Store usage
 
