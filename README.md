@@ -68,11 +68,11 @@ homecredit-aws-mlops/
 |---|---|---|---|
 | 1 ✅ | CDK base stack (S3 × 3, IAM, budget), local LightGBM baseline on depth-0 tables (224 features) | Reproducible infra | val AUC **0.823**, stability **0.620** |
 | 2 ✅ | Glue PySpark ETL over all 30+ raw tables (975 features incl. PIT-filtered depth-1/2 aggregations), Athena external table, Feature Group contract for Phase 4 | PIT correctness, wide feature catalog | val AUC **0.819**, stability **0.612** (⚠ wider feature set overfits — HPO is Phase 3's job) |
-| 3 | SageMaker Pipeline: preprocess → train → evaluate → conditional register + **HPO** | DAGs, HPO, gating | |
-| 4 | Real-time endpoint + batch transform, API Gateway, autoscaling, Feature Store online | Two serving modes, blue/green | |
+| 3 🟡 | SageMaker Pipeline: PullFeatures → HPO TuningStep → Evaluate → ConditionStep → RegisterModel. CDK stack `HomeCreditTrainingStack` + pipeline upserted in account | DAGs, HPO, gating | Blocked on AWS account service quotas (`ml.m5.xlarge processing job usage = 0`) — pending quota-increase request or switch to t3.xlarge (default quota 2) |
+| 4 | Batch Transform only (user opted out of real-time endpoint for cost), Model Package Group → ScheduledEventBridge → Lambda → StartTransformJob | Batch serving, Model Registry workflow | |
 | 5 | Model Monitor + CloudWatch + EventBridge → auto-retrain | Closed-loop drift response | |
 | 6 | Clarify bias, Model Cards, lineage via CloudTrail | Responsible AI, audit | |
-| 7 | Spot training, endpoint autoscale-to-zero, cost dashboards | FinOps | |
+| 7 | Spot training, CloudWatch dashboards, nightly cleanup | FinOps | |
 
 ## Quickstart
 
@@ -107,6 +107,9 @@ uv run python src/features/ingest_to_feature_store.py
 
 # 9. (Phase 2) Retrain LightGBM straight from the Feature Store
 uv run python src/training/train_lightgbm.py --feature-source athena
+
+# 10. (Phase 3) Upsert + start HPO pipeline (requires ml.m5.xlarge quota — see below)
+uv run python scripts/run_training_pipeline.py --max-jobs 5 --upsert --start
 ```
 
 Everything runs inside the `uv`-managed venv via `uv run <cmd>` — no manual activation.
@@ -120,6 +123,47 @@ This project runs under a **dedicated IAM user** (`homecredit-dev`) in `us-west-
 ```bash
 uv run python docs/architecture.py   # writes architecture.png + architecture.svg
 ```
+
+## Notes on Phase 3 — HPO pipeline
+
+`HomeCreditTrainingPipeline` is a 4-step SageMaker Pipeline defined in
+[`src/pipelines/training_pipeline.py`](src/pipelines/training_pipeline.py):
+
+1. **PullFeatures** — `ScriptProcessor` runs `pull_features.py`, queries
+   `homecredit_ml.features` via Athena CTAS, writes time-split train/val parquet.
+2. **HPOTuning** — `TuningStep` running SageMaker Automatic Model Tuning,
+   Bayesian search over `num-leaves`, `learning-rate`, `feature-fraction`,
+   `bagging-fraction`. Objective = maximize weekly-stability metric parsed
+   from training-job log regex.
+3. **EvaluateBestModel** — pulls the best trial artifact, runs `evaluate.py`
+   for the full AUC + stability report, writes `evaluation.json`.
+4. **StabilityGate** (`ConditionStep`) — if `stability ≥ 0.55`, register the
+   model to `HomeCreditModels` package group as `PendingManualApproval`.
+
+**Known blockers (chasing them in order):**
+
+1. **AWS account service quotas** — fresh accounts ship with
+   `ml.m5.xlarge processing/training job usage = 0`. Only `ml.t3.{medium,
+   large,xlarge}` have nonzero defaults. Pipeline currently pinned to t3.xlarge
+   (sufficient for 975-feature LightGBM, slower per trial). Production fix:
+   AWS Service Quotas request for `ml.m5.xlarge` (1–3 days turnaround).
+2. **Container dependency hell** — the SageMaker `sklearn 1.2-1` base image
+   ships Python 3.9 + numpy 1.24 + pandas 1.1 + scipy 1.8, all binary-
+   compatible with each other. Layering modern `awswrangler` / `pyarrow`
+   via `requirements.txt` forces a partial upgrade that breaks numpy ABI on
+   pyarrow's Table → pandas conversion (`numpy.core.multiarray failed to
+   import`). Tried `--force-reinstall` of the whole numpy/pandas/pyarrow
+   group — got further (Athena CTAS query succeeded, output parquet read)
+   but hit a `MultiIndex` deserialization failure during column metadata
+   reconstruction at 975-column scale. Production fix: custom Docker image
+   in ECR with the data stack baked in, plus `--datalake-formats iceberg`
+   for write parity. Tracked as Phase 7 FinOps "BYO container" task.
+
+Until those are unblocked, Phase 3 is **code-complete + CDK-deployed**:
+`HomeCreditTrainingStack` is live, `HomeCreditModels` package group exists,
+`HomeCreditTrainingPipeline` is upserted and visible in SageMaker Studio,
+and any pipeline execution gets as far as the PullFeatures step before the
+container env mismatch trips it.
 
 ## Notes on Feature Store usage
 

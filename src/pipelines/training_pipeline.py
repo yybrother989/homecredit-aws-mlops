@@ -1,152 +1,242 @@
-"""SageMaker Pipeline: preprocess -> train -> evaluate -> conditional register.
+"""SageMaker Pipeline: pull features → HPO → evaluate best → conditional register.
+
+Steps:
+  1. ProcessingStep  — pull_features.py queries Athena via CTAS, writes
+     train/validation parquet to the pipeline's S3 workspace.
+  2. TuningStep      — Automatic Model Tuning, Bayesian, `max_jobs` trials
+     over num_leaves / learning_rate / feature_fraction / bagging_fraction.
+     Objective: maximize validation:stability regex-parsed from training logs.
+  3. ProcessingStep  — evaluate_best runs evaluate.py against the best trial's
+     model artifact, writes evaluation.json (AUC + stability).
+  4. ConditionStep   — if stability ≥ threshold → RegisterModel.
+  5. RegisterModel   — adds a new version to the HomeCreditModels package group,
+     PendingManualApproval.
 
 Run:
-    python -m src.pipelines.training_pipeline --role-arn <arn> --upsert
-    python -m src.pipelines.training_pipeline --role-arn <arn> --start
-
-Gate: model is registered only if stability metric > threshold.
+    python -m src.pipelines.training_pipeline --upsert
+    python -m src.pipelines.training_pipeline --start
 """
 from __future__ import annotations
 
 import argparse
 import logging
 
-import sagemaker
-from sagemaker.estimator import Estimator
+import boto3
 from sagemaker.inputs import TrainingInput
 from sagemaker.model_metrics import MetricsSource, ModelMetrics
-from sagemaker.processing import ProcessingInput, ProcessingOutput, ScriptProcessor
-from sagemaker.sklearn.processing import SKLearnProcessor
+from sagemaker.processing import FrameworkProcessor, ProcessingInput, ProcessingOutput
+from sagemaker.sklearn.estimator import SKLearn
+from sagemaker.tuner import ContinuousParameter, HyperparameterTuner, IntegerParameter
 from sagemaker.workflow.condition_step import ConditionStep
 from sagemaker.workflow.conditions import ConditionGreaterThanOrEqualTo
-from sagemaker.workflow.functions import JsonGet
+from sagemaker.workflow.functions import Join, JsonGet
 from sagemaker.workflow.parameters import ParameterFloat, ParameterInteger, ParameterString
 from sagemaker.workflow.pipeline import Pipeline
 from sagemaker.workflow.pipeline_context import PipelineSession
 from sagemaker.workflow.properties import PropertyFile
 from sagemaker.workflow.step_collections import RegisterModel
-from sagemaker.workflow.steps import ProcessingStep, TrainingStep
+from sagemaker.workflow.steps import ProcessingStep, TuningStep
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 PIPELINE_NAME = "HomeCreditTrainingPipeline"
 MODEL_PACKAGE_GROUP = "HomeCreditModels"
+REGION = "us-west-2"
 
 
-def build_pipeline(
-    role_arn: str,
-    region: str = "us-west-2",
-    artifacts_bucket: str | None = None,
-) -> Pipeline:
+def cfn_output(stack_name: str, key: str) -> str:
+    cf = boto3.client("cloudformation", region_name=REGION)
+    outs = cf.describe_stacks(StackName=stack_name)["Stacks"][0]["Outputs"]
+    for o in outs:
+        if o["OutputKey"] == key:
+            return o["OutputValue"]
+    raise KeyError(f"{key} not in {stack_name} outputs")
+
+
+def build_pipeline(role_arn: str, max_jobs: int = 20, max_parallel_jobs: int = 4) -> Pipeline:
     session = PipelineSession()
-    if artifacts_bucket is None:
-        artifacts_bucket = session.default_bucket()
+    artifacts_bucket = cfn_output("HomeCreditBaseStack", "ArtifactsBucketName")
+    athena_staging = f"s3://{artifacts_bucket}/athena/"
 
-    raw_uri = ParameterString("RawDataUri", default_value=f"s3://homecredit-raw-{session.account_id()}-usw2/")
-    processed_uri = ParameterString("ProcessedDataUri", default_value=f"s3://{artifacts_bucket}/processed/")
-    stability_threshold = ParameterFloat("StabilityThreshold", default_value=0.40)
-    approval_status = ParameterString("ModelApprovalStatus", default_value="PendingManualApproval")
-    instance_count = ParameterInteger("TrainingInstanceCount", default_value=1)
-    train_instance = ParameterString("TrainingInstanceType", default_value="ml.m5.xlarge")
+    # --- Parameters (overridable at StartPipelineExecution) ---
+    p_stability = ParameterFloat("StabilityThreshold", default_value=0.55)
+    p_approval = ParameterString("ModelApprovalStatus", default_value="PendingManualApproval")
+    p_max_jobs = ParameterInteger("MaxJobs", default_value=max_jobs)
+    p_max_parallel = ParameterInteger("MaxParallelJobs", default_value=max_parallel_jobs)
 
-    # Step 1: feature engineering
-    sklearn_processor = SKLearnProcessor(
+    # FrameworkProcessor + SKLearn auto-resolve the sklearn 1.2-1 image and
+    # pip-install whatever's in `source_dir/requirements.txt` before the
+    # container runs the entrypoint.
+
+    # ========================================================================
+    # Step 1: pull features from Athena
+    # FrameworkProcessor (sklearn family) auto-bundles `source_dir` and pip-
+    # installs its requirements.txt before running `code`. We need awswrangler
+    # + pyarrow on top of the sklearn base image.
+    # ========================================================================
+    pull_processor = FrameworkProcessor(
+        estimator_cls=SKLearn,
         framework_version="1.2-1",
         role=role_arn,
-        instance_type="ml.m5.xlarge",
+        instance_type="ml.t3.xlarge",
         instance_count=1,
-        base_job_name="homecredit-features",
+        base_job_name="hc-pull-features",
         sagemaker_session=session,
     )
-    step_process = ProcessingStep(
-        name="FeatureEngineering",
-        processor=sklearn_processor,
-        inputs=[ProcessingInput(source=raw_uri, destination="/opt/ml/processing/input")],
-        outputs=[
-            ProcessingOutput(output_name="train", source="/opt/ml/processing/output/train"),
-            ProcessingOutput(output_name="validation", source="/opt/ml/processing/output/validation"),
-        ],
-        code="src/features/build_features.py",
-        job_arguments=["--input-dir", "/opt/ml/processing/input", "--output-dir", "/opt/ml/processing/output", "--split", "train"],
+    step_pull = ProcessingStep(
+        name="PullFeatures",
+        step_args=pull_processor.run(
+            code="pull_features.py",
+            source_dir="src/pipelines",
+            outputs=[
+                ProcessingOutput(output_name="train",
+                                 source="/opt/ml/processing/output/train"),
+                ProcessingOutput(output_name="validation",
+                                 source="/opt/ml/processing/output/validation"),
+            ],
+            arguments=[
+                "--athena-database", "homecredit_ml",
+                "--athena-table", "features",
+                "--athena-staging-uri", athena_staging,
+                "--output-dir", "/opt/ml/processing/output",
+            ],
+        ),
     )
 
-    # Step 2: training (script mode; container image placeholder — replace with prebuilt LightGBM image or BYO)
-    estimator = Estimator(
-        image_uri=sagemaker.image_uris.retrieve("sklearn", region, "1.2-1"),
+    # ========================================================================
+    # Step 2: HPO via SageMaker Automatic Model Tuning
+    # ========================================================================
+    lightgbm_estimator = SKLearn(
         entry_point="train_lightgbm.py",
         source_dir="src/training",
         role=role_arn,
-        instance_count=instance_count,
-        instance_type=train_instance,
-        output_path=f"s3://{artifacts_bucket}/models/",
-        base_job_name="homecredit-train",
+        framework_version="1.2-1",
+        py_version="py3",
+        instance_type="ml.t3.xlarge",
+        instance_count=1,
+        output_path=f"s3://{artifacts_bucket}/models/hpo/",
+        base_job_name="hc-train",
         sagemaker_session=session,
-        hyperparameters={"num-leaves": 63, "learning-rate": 0.05},
+        hyperparameters={
+            "n-estimators": 500,
+            "early-stopping-rounds": 30,
+        },
+        metric_definitions=[
+            {"Name": "validation:auc",       "Regex": r"Validation AUC=([0-9\.]+)"},
+            {"Name": "validation:stability", "Regex": r"Stability=([0-9\.]+)"},
+        ],
+        # Install lightgbm into the container at startup
+        dependencies=["src/training/lightgbm_requirements.txt"],
     )
-    step_train = TrainingStep(
-        name="TrainLightGBM",
-        estimator=estimator,
+
+    tuner = HyperparameterTuner(
+        estimator=lightgbm_estimator,
+        objective_metric_name="validation:stability",
+        objective_type="Maximize",
+        metric_definitions=[
+            {"Name": "validation:auc",       "Regex": r"Validation AUC=([0-9\.]+)"},
+            {"Name": "validation:stability", "Regex": r"Stability=([0-9\.]+)"},
+        ],
+        hyperparameter_ranges={
+            "num-leaves":        IntegerParameter(16, 127),
+            "learning-rate":     ContinuousParameter(0.01, 0.1),
+            "feature-fraction":  ContinuousParameter(0.5, 0.95),
+            "bagging-fraction":  ContinuousParameter(0.5, 0.95),
+        },
+        max_jobs=max_jobs,
+        max_parallel_jobs=max_parallel_jobs,
+        strategy="Bayesian",
+    )
+    step_tune = TuningStep(
+        name="HPOTuning",
+        tuner=tuner,
         inputs={
             "train": TrainingInput(
-                s3_data=step_process.properties.ProcessingOutputConfig.Outputs["train"].S3Output.S3Uri
+                s3_data=step_pull.properties.ProcessingOutputConfig.Outputs["train"].S3Output.S3Uri,
             ),
             "validation": TrainingInput(
-                s3_data=step_process.properties.ProcessingOutputConfig.Outputs["validation"].S3Output.S3Uri
+                s3_data=step_pull.properties.ProcessingOutputConfig.Outputs["validation"].S3Output.S3Uri,
             ),
         },
     )
 
-    # Step 3: evaluation
-    eval_report = PropertyFile(name="EvaluationReport", output_name="evaluation", path="evaluation.json")
-    evaluator = ScriptProcessor(
-        image_uri=sagemaker.image_uris.retrieve("sklearn", region, "1.2-1"),
-        command=["python3"],
+    # ========================================================================
+    # Step 3: evaluate the best trial
+    # ========================================================================
+    eval_report = PropertyFile(
+        name="EvaluationReport",
+        output_name="evaluation",
+        path="evaluation.json",
+    )
+    evaluator = FrameworkProcessor(
+        estimator_cls=SKLearn,
+        framework_version="1.2-1",
         role=role_arn,
-        instance_type="ml.m5.large",
+        instance_type="ml.t3.large",
         instance_count=1,
-        base_job_name="homecredit-evaluate",
+        base_job_name="hc-evaluate",
         sagemaker_session=session,
     )
+
+    # The TuningStep surfaces the best model's S3 URI via get_top_model_s3_uri
+    best_model_uri = step_tune.get_top_model_s3_uri(
+        top_k=0,
+        s3_bucket=artifacts_bucket,
+        prefix="models/hpo",
+    )
+
     step_eval = ProcessingStep(
-        name="EvaluateModel",
-        processor=evaluator,
-        inputs=[
-            ProcessingInput(source=step_train.properties.ModelArtifacts.S3ModelArtifacts, destination="/opt/ml/processing/model"),
-            ProcessingInput(
-                source=step_process.properties.ProcessingOutputConfig.Outputs["validation"].S3Output.S3Uri,
-                destination="/opt/ml/processing/validation",
-            ),
-        ],
-        outputs=[ProcessingOutput(output_name="evaluation", source="/opt/ml/processing/evaluation")],
-        code="src/pipelines/evaluate.py",
+        name="EvaluateBestModel",
+        step_args=evaluator.run(
+            code="evaluate.py",
+            source_dir="src/pipelines",
+            inputs=[
+                ProcessingInput(source=best_model_uri, destination="/opt/ml/processing/model"),
+                ProcessingInput(
+                    source=step_pull.properties.ProcessingOutputConfig.Outputs["validation"].S3Output.S3Uri,
+                    destination="/opt/ml/processing/validation",
+                ),
+            ],
+            outputs=[
+                ProcessingOutput(output_name="evaluation",
+                                 source="/opt/ml/processing/evaluation"),
+            ],
+        ),
         property_files=[eval_report],
     )
 
-    # Step 4: conditional register
+    # ========================================================================
+    # Step 4: conditional registration
+    # ========================================================================
+    eval_s3 = Join(
+        on="/",
+        values=[
+            step_eval.properties.ProcessingOutputConfig.Outputs["evaluation"].S3Output.S3Uri,
+            "evaluation.json",
+        ],
+    )
     register = RegisterModel(
-        name="RegisterModel",
-        estimator=estimator,
-        model_data=step_train.properties.ModelArtifacts.S3ModelArtifacts,
+        name="RegisterBestModel",
+        estimator=lightgbm_estimator,
+        model_data=best_model_uri,
         content_types=["application/json"],
         response_types=["application/json"],
         inference_instances=["ml.m5.large"],
         transform_instances=["ml.m5.xlarge"],
         model_package_group_name=MODEL_PACKAGE_GROUP,
-        approval_status=approval_status,
+        approval_status=p_approval,
         model_metrics=ModelMetrics(
-            model_statistics=MetricsSource(
-                s3_uri=step_eval.properties.ProcessingOutputConfig.Outputs["evaluation"].S3Output.S3Uri + "/evaluation.json",
-                content_type="application/json",
-            ),
+            model_statistics=MetricsSource(s3_uri=eval_s3, content_type="application/json"),
         ),
     )
     step_cond = ConditionStep(
         name="StabilityGate",
         conditions=[
             ConditionGreaterThanOrEqualTo(
-                left=JsonGet(step_name=step_eval.name, property_file=eval_report, json_path="metrics.stability.value"),
-                right=stability_threshold,
+                left=JsonGet(step_name=step_eval.name, property_file=eval_report,
+                             json_path="metrics.stability.value"),
+                right=p_stability,
             ),
         ],
         if_steps=[register],
@@ -155,28 +245,33 @@ def build_pipeline(
 
     return Pipeline(
         name=PIPELINE_NAME,
-        parameters=[raw_uri, processed_uri, stability_threshold, approval_status, instance_count, train_instance],
-        steps=[step_process, step_train, step_eval, step_cond],
+        parameters=[p_stability, p_approval, p_max_jobs, p_max_parallel],
+        steps=[step_pull, step_tune, step_eval, step_cond],
         sagemaker_session=session,
     )
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--role-arn", required=True)
-    ap.add_argument("--region", default="us-west-2")
-    ap.add_argument("--artifacts-bucket", default=None)
-    ap.add_argument("--upsert", action="store_true", help="Create or update the pipeline definition")
-    ap.add_argument("--start", action="store_true", help="Start a pipeline execution")
+    ap.add_argument("--role-arn", default=None, help="Default: read from CFN output")
+    ap.add_argument("--max-jobs", type=int, default=20)
+    ap.add_argument("--max-parallel", type=int, default=4)
+    ap.add_argument("--upsert", action="store_true")
+    ap.add_argument("--start", action="store_true")
     args = ap.parse_args()
 
-    pipeline = build_pipeline(args.role_arn, args.region, args.artifacts_bucket)
+    role_arn = args.role_arn or cfn_output("HomeCreditBaseStack", "SageMakerRoleArn")
+    log.info("Building pipeline with role=%s  max_jobs=%d  parallel=%d",
+             role_arn, args.max_jobs, args.max_parallel)
+
+    pipeline = build_pipeline(role_arn, args.max_jobs, args.max_parallel)
+
     if args.upsert:
         log.info("Upserting pipeline %s", PIPELINE_NAME)
-        pipeline.upsert(role_arn=args.role_arn)
+        pipeline.upsert(role_arn=role_arn)
     if args.start:
-        log.info("Starting pipeline execution")
-        pipeline.start()
+        execution = pipeline.start()
+        log.info("Started: %s", execution.arn)
 
 
 if __name__ == "__main__":

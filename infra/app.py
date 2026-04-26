@@ -5,6 +5,7 @@ import os
 import aws_cdk as cdk
 from stacks.base_stack import HomeCreditBaseStack
 from stacks.feature_stack import HomeCreditFeatureStack
+from stacks.training_stack import HomeCreditTrainingStack
 
 app = cdk.App()
 
@@ -44,6 +45,14 @@ HomeCreditFeatureStack(
     processed_bucket=base.processed_bucket,
     artifacts_bucket=base.artifacts_bucket,
     glue_role=base.glue_role,
+)
+
+HomeCreditTrainingStack(
+    app,
+    "HomeCreditTrainingStack",
+    env=env,
+    description="Phase 3: Model Package Group + Athena/Glue grants for HPO pipeline",
+    sm_role=base.sm_role,
 )
 
 app.synth()
